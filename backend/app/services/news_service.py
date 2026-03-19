@@ -6,10 +6,9 @@ from datetime import datetime, timedelta, timezone
 
 import feedparser
 import httpx
-from openai import AsyncOpenAI
-
 from app.config import settings
 from app.schemas import NewsArticle, SentimentScore
+from app.services.llm import get_client, get_model
 
 logger = logging.getLogger(__name__)
 
@@ -148,27 +147,31 @@ async def _fetch_newsapi(ticker: str) -> list[dict]:
 
 
 async def _score_sentiment_batch(ticker: str, headlines: list[str]) -> list[dict]:
-    if not settings.openai_api_key or not headlines:
+    client = get_client()
+    if not client or not headlines:
         return [{"score": 0.0, "label": "neutral"} for _ in headlines]
 
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
     numbered = "\n".join(f"{i+1}. {h}" for i, h in enumerate(headlines))
     prompt = (
-        f"Score these {len(headlines)} news headlines for the stock ticker {ticker}. "
-        f"Return a JSON array of objects with 'score' (-1.0 to 1.0) and 'label' (positive/negative/neutral).\n\n"
-        f"{numbered}\n\n"
-        "Return ONLY the JSON array, no other text."
+        f"You are scoring news headlines for their likely impact on {ticker} stock price.\n\n"
+        f"Headlines:\n{numbered}\n\n"
+        f"For each headline, assign:\n"
+        f"  score: float from -1.0 (very negative) to +1.0 (very positive) for {ticker}'s stock\n"
+        f"  label: 'positive', 'negative', or 'neutral'\n\n"
+        "Consider: earnings surprises, product launches, regulatory news, analyst upgrades/downgrades, macro events.\n"
+        "Return ONLY a JSON array with exactly {len(headlines)} objects: "
+        '[{"score": 0.0, "label": "neutral"}, ...]'
     )
 
     try:
         resp = await client.chat.completions.create(
-            model=settings.openai_model,
+            model=get_model(),
             messages=[
-                {"role": "system", "content": "You are a financial sentiment analyzer. Return only valid JSON."},
+                {"role": "system", "content": "You are a professional financial sentiment analyst specializing in equity market impact. Return only valid JSON arrays — no markdown, no explanation."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
-            max_tokens=1000,
+            max_tokens=1200,
         )
         content = resp.choices[0].message.content or "[]"
         # Extract JSON array

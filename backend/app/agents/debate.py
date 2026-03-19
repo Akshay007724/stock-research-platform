@@ -4,12 +4,10 @@ import asyncio
 import json
 import logging
 
-from openai import AsyncOpenAI
-
-from app.config import settings
 from app.mcp.bus import MCPBus
 from app.mcp.registry import registry
 from app.schemas import AgentEvent, DebateArgument, DebateResult, MarketData, TechnicalIndicators
+from app.services.llm import get_client, get_model, provider_label
 
 logger = logging.getLogger(__name__)
 
@@ -40,26 +38,27 @@ def _build_market_summary(ticker: str, market_data: MarketData, indicators: Tech
     return "\n".join(l for l in lines if l)
 
 
-async def _run_bull_agent(ticker: str, summary: str, client: AsyncOpenAI) -> DebateArgument:
+async def _run_bull_agent(ticker: str, summary: str, client) -> DebateArgument:
     prompt = (
-        f"You are an aggressive bull investor analyzing {ticker}.\n\n"
-        f"Market and technical data:\n{summary}\n\n"
-        "Make the STRONGEST possible BUY argument. Be specific and reference actual numbers from the data. "
-        "Return JSON only (no other text):\n"
-        '{"points": ["reason 1", "reason 2", "reason 3", "reason 4", "reason 5"], '
-        '"score": <float 0-10>, '
-        '"key_metrics": {"metric_name": "value or analysis"}}'
+        f"You are an experienced buy-side equity analyst building the strongest possible investment case for {ticker}.\n\n"
+        f"Live market and technical data:\n{summary}\n\n"
+        "Task: Construct 5 specific, data-driven BUY arguments. Each point must cite actual numbers from the data above. "
+        "Avoid generic statements — every argument must be grounded in the provided metrics.\n\n"
+        "Return ONLY valid JSON (no markdown, no preamble):\n"
+        '{"points": ["<specific argument with numbers>", ...5 items...], '
+        '"score": <float 0-10 reflecting conviction>, '
+        '"key_metrics": {"<metric>": "<interpretation>"}}'
     )
 
     try:
         resp = await client.chat.completions.create(
-            model=settings.openai_model,
+            model=get_model(),
             messages=[
-                {"role": "system", "content": "You are a bullish stock analyst. Always return valid JSON only."},
+                {"role": "system", "content": "You are a senior buy-side equity analyst at a top hedge fund. You write precise, data-driven investment arguments. Always return valid JSON only — no markdown, no explanation outside the JSON."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.7,
-            max_tokens=800,
+            temperature=0.6,
+            max_tokens=900,
         )
         content = resp.choices[0].message.content or "{}"
         start = content.find("{")
@@ -87,26 +86,28 @@ async def _run_bull_agent(ticker: str, summary: str, client: AsyncOpenAI) -> Deb
     )
 
 
-async def _run_bear_agent(ticker: str, summary: str, client: AsyncOpenAI) -> DebateArgument:
+async def _run_bear_agent(ticker: str, summary: str, client) -> DebateArgument:
     prompt = (
-        f"You are an aggressive bear investor analyzing {ticker}.\n\n"
-        f"Market and technical data:\n{summary}\n\n"
-        "Make the STRONGEST possible SELL/SHORT argument. Be specific and reference actual numbers from the data. "
-        "Return JSON only (no other text):\n"
-        '{"points": ["reason 1", "reason 2", "reason 3", "reason 4", "reason 5"], '
-        '"score": <float 0-10>, '
-        '"key_metrics": {"metric_name": "value or analysis"}}'
+        f"You are an experienced short-seller and risk analyst stress-testing the bear case for {ticker}.\n\n"
+        f"Live market and technical data:\n{summary}\n\n"
+        "Task: Construct 5 specific, data-driven SELL/AVOID arguments. Each point must cite actual numbers from the data above. "
+        "Focus on valuation risk, technical breakdown signals, and downside scenarios. "
+        "Avoid generic statements — every argument must be grounded in the provided metrics.\n\n"
+        "Return ONLY valid JSON (no markdown, no preamble):\n"
+        '{"points": ["<specific argument with numbers>", ...5 items...], '
+        '"score": <float 0-10 reflecting conviction>, '
+        '"key_metrics": {"<metric>": "<risk interpretation>"}}'
     )
 
     try:
         resp = await client.chat.completions.create(
-            model=settings.openai_model,
+            model=get_model(),
             messages=[
-                {"role": "system", "content": "You are a bearish stock analyst. Always return valid JSON only."},
+                {"role": "system", "content": "You are a senior short-seller and risk analyst at a top hedge fund. You write precise, data-driven risk arguments. Always return valid JSON only — no markdown, no explanation outside the JSON."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.7,
-            max_tokens=800,
+            temperature=0.6,
+            max_tokens=900,
         )
         content = resp.choices[0].message.content or "{}"
         start = content.find("{")
@@ -134,30 +135,32 @@ async def _run_bear_agent(ticker: str, summary: str, client: AsyncOpenAI) -> Deb
     )
 
 
-async def _run_moderator(ticker: str, bull: DebateArgument, bear: DebateArgument, client: AsyncOpenAI) -> tuple[str, float, str]:
-    bull_points = "\n".join(f"- {p}" for p in bull.points)
-    bear_points = "\n".join(f"- {p}" for p in bear.points)
+async def _run_moderator(ticker: str, bull: DebateArgument, bear: DebateArgument, client) -> tuple[str, float, str]:
+    bull_points = "\n".join(f"  {i+1}. {p}" for i, p in enumerate(bull.points))
+    bear_points = "\n".join(f"  {i+1}. {p}" for i, p in enumerate(bear.points))
 
     prompt = (
-        f"You are an objective debate moderator evaluating a bull vs bear debate for {ticker}.\n\n"
-        f"BULL CASE (score {bull.score}/10):\n{bull_points}\n\n"
-        f"BEAR CASE (score {bear.score}/10):\n{bear_points}\n\n"
-        "Evaluate both sides objectively. Which case is stronger based on the arguments? "
-        "Return JSON only:\n"
-        '{"verdict": "bull" or "bear" or "neutral", '
-        '"verdict_score": <float 0-10 where 10 = decisive bull, 0 = decisive bear, 5 = neutral>, '
-        '"moderator_summary": "<2-3 sentence objective summary>"}'
+        f"You are a CFA-certified portfolio manager moderating an investment debate on {ticker}.\n\n"
+        f"BULL CASE (self-score: {bull.score:.1f}/10):\n{bull_points}\n\n"
+        f"BEAR CASE (self-score: {bear.score:.1f}/10):\n{bear_points}\n\n"
+        "Evaluate the quality of each argument's evidence and logic independently. "
+        "Determine which case is better supported by the data. Your verdict_score should reflect the balance of evidence, "
+        "not just which side has more points. Write a 2-3 sentence summary that a fund manager could read before making a decision.\n\n"
+        "Return ONLY valid JSON:\n"
+        '{"verdict": "bull" | "bear" | "neutral", '
+        '"verdict_score": <float 0-10: 10=strong bull, 5=neutral, 0=strong bear>, '
+        '"moderator_summary": "<concise, specific 2-3 sentence summary citing key evidence>"}'
     )
 
     try:
         resp = await client.chat.completions.create(
-            model=settings.openai_model,
+            model=get_model(),
             messages=[
-                {"role": "system", "content": "You are an objective financial debate moderator. Return valid JSON only."},
+                {"role": "system", "content": "You are a CFA-certified portfolio manager and objective investment debate moderator. Evaluate arguments on evidence quality, not quantity. Always return valid JSON only — no markdown, no text outside JSON."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.3,
-            max_tokens=500,
+            temperature=0.2,
+            max_tokens=600,
         )
         content = resp.choices[0].message.content or "{}"
         start = content.find("{")
@@ -176,7 +179,8 @@ async def _run_moderator(ticker: str, bull: DebateArgument, bear: DebateArgument
 
 async def run(ticker: str, market_data: MarketData, indicators: TechnicalIndicators, bus: MCPBus) -> DebateResult:
     """Debate Agent: runs bull vs bear debate with a moderator."""
-    client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+    client = get_client()
+    llm_label = provider_label()
 
     summary = _build_market_summary(ticker, market_data, indicators)
 
@@ -188,7 +192,7 @@ async def run(ticker: str, market_data: MarketData, indicators: TechnicalIndicat
         AgentEvent(
             agent_name="debate_bull",
             event_type="start",
-            message=f"Bull agent building investment case for {ticker}",
+            message=f"Bull agent building investment case for {ticker} via {llm_label}",
         ),
     )
     await bus.publish(
@@ -196,7 +200,7 @@ async def run(ticker: str, market_data: MarketData, indicators: TechnicalIndicat
         AgentEvent(
             agent_name="debate_bear",
             event_type="start",
-            message=f"Bear agent building risk case for {ticker}",
+            message=f"Bear agent building risk case for {ticker} via {llm_label}",
         ),
     )
 

@@ -3,10 +3,8 @@ from __future__ import annotations
 import json
 import logging
 
-from openai import AsyncOpenAI
-
-from app.config import settings
 from app.mcp.bus import MCPBus
+from app.services.llm import get_client, get_model, provider_label
 from app.mcp.registry import registry
 from app.schemas import AgentEvent, DebateResult, MarketData, Recommendation, SentimentScore, TechnicalIndicators
 
@@ -259,30 +257,40 @@ async def run(
             ),
         )
 
-        # Generate reasoning bullets via OpenAI if available
+        # Generate reasoning bullets via LLM
         reasoning: list[str] = []
-        all_signals = tech_signals[:2] + fund_signals[:2] + sentiment.signals[:1] + [debate.moderator_summary[:100]]
+        all_signals = tech_signals[:2] + fund_signals[:2] + sentiment.signals[:1] + [debate.moderator_summary[:150]]
+        client = get_client()
 
-        if settings.openai_api_key:
+        if client:
             try:
-                await bus.publish(ticker, AgentEvent(agent_name=agent, event_type="progress", message="Generating investment rationale with AI..."))
-                client = AsyncOpenAI(api_key=settings.openai_api_key)
-                signals_text = "\n".join(f"- {s}" for s in all_signals)
+                llm_label = provider_label()
+                await bus.publish(ticker, AgentEvent(agent_name=agent, event_type="progress", message=f"Generating investment rationale via {llm_label}..."))
+                signals_text = "\n".join(f"- {s}" for s in all_signals if s)
                 resp = await client.chat.completions.create(
-                    model=settings.openai_model,
+                    model=get_model(),
                     messages=[
-                        {"role": "system", "content": "You are a professional stock analyst. Write concise, specific investment reasoning bullets."},
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a portfolio manager writing the investment rationale section of a research note. "
+                                "Be specific, cite numbers, and explain the 'why' behind each point. "
+                                "Return valid JSON only — a JSON array of strings, nothing else."
+                            ),
+                        },
                         {
                             "role": "user",
                             "content": (
-                                f"Write 4 concise reasoning bullets for a {action} recommendation on {ticker} "
-                                f"(composite score: {composite:.1f}/100).\n\nKey signals:\n{signals_text}\n\n"
-                                "Return JSON array of strings only: [\"bullet1\", \"bullet2\", \"bullet3\", \"bullet4\"]"
+                                f"Write 4 concise but specific investment rationale bullets for a {action} recommendation on {ticker}.\n"
+                                f"Composite score: {composite:.1f}/100 | Technical: {technical_score:.0f} | Sentiment: {sentiment_score_normalized:.0f} | Fundamental: {fundamental_score:.0f} | Debate: {debate_score:.0f}\n\n"
+                                f"Key signals:\n{signals_text}\n\n"
+                                "Each bullet should be one clear sentence that a fund manager can act on. "
+                                "Return ONLY a JSON array: [\"bullet1\", \"bullet2\", \"bullet3\", \"bullet4\"]"
                             ),
                         },
                     ],
-                    temperature=0.4,
-                    max_tokens=400,
+                    temperature=0.3,
+                    max_tokens=500,
                 )
                 content = resp.choices[0].message.content or "[]"
                 start = content.find("[")
